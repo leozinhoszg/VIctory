@@ -861,6 +861,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if unlike(dst, src) {
                 return;
             }
+            // Two title textures over the same memory resolve to one host
+            // texture: the copy changes nothing there, and D3D12 refuses a
+            // copy of a resource onto itself (debug layer id 998).
+            {
+                use windows::core::Interface;
+                if to.as_raw() == from.as_raw() {
+                    return;
+                }
+            }
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {

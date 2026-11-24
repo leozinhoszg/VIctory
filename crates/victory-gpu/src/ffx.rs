@@ -269,7 +269,7 @@ pub extern "C" fn ffxCreateContext(
     let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
     let provider = provider_name(context);
     crate::host::set_caption_note(format!(
-        "FSR host {provider} {}x{}\u{2192}{}x{}",
+        "AMD FidelityFX FSR {provider} {}x{}\u{2192}{}x{}",
         upscale.max_render[0], upscale.max_render[1], upscale.max_upscale[0], upscale.max_upscale[1]
     ));
     tracing::info!(
@@ -616,7 +616,7 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
                 tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, jitter = ?d.jitter, mv_scale = ?d.motion_vector_scale, camera = ?d.camera, flags = CREATE_FLAGS.load(std::sync::atomic::Ordering::Relaxed), "dlss: first upscale recorded by DLSS");
                 if let Some(dl) = dlss() {
                     crate::host::set_caption_note(format!(
-                        "{} {}x{}\u{2192}{}x{}",
+                        "NVIDIA {} {}x{}\u{2192}{}x{}",
                         dl.versions, d.render_size[0], d.render_size[1], d.upscale_size[0], d.upscale_size[1]
                     ));
                 }

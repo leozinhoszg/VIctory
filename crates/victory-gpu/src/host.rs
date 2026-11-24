@@ -5849,8 +5849,12 @@ impl Meter {
         let Some(caption) = &self.caption else { return };
         let build = option_env!("VICTORY_BUILD_LABEL").unwrap_or(env!("CARGO_PKG_VERSION"));
         let note = CAPTION_NOTE.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let note = if note.is_empty() { "upscaler do t\u{ed}tulo".to_owned() } else { note };
-        let text = format!(" | VIctory {build} | {note} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let note = if note.is_empty() { "upscaler pr\u{f3}prio do t\u{ed}tulo (sem DLSS/FSR)".to_owned() } else { note };
+        let console = crate::console::current().name();
+        let (ow, oh) = crate::dxgi::display_size();
+        let text = format!(
+            " | VIctory {build} | {console}, sa\u{ed}da {ow}x{oh} | {note} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"
+        );
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,

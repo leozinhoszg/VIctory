@@ -51,6 +51,10 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
+/// Set when the title opens its story world's data: unattended presses
+/// (diagnostics builds) stop for good.
+pub(crate) static WORLD_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
@@ -1144,6 +1148,12 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
+            // The unattended presses (`VICTORY_AUTOSTART`) hold a button on
+            // the first real pad as well.
+            #[cfg(feature = "diagnostics")]
+            if let Some((_, bit)) = auto_press() {
+                state.Gamepad.wButtons |= bit;
+            }
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
@@ -1231,10 +1241,125 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        if let Some((key, _)) = auto_press()
+            && !down.contains(&key)
+        {
+            down.push(key);
+        }
+        down
+    }
+
+    /// Debugging aid for runs nobody attends: deliberate single presses, each
+    /// a quarter of a second down and then up, with or without focus, on the
+    /// host pads, the keyboard and its stand-in pad. Nothing is pressed once
+    /// the title starts loading its world ([`WORLD_LOADING`]).
+    ///
+    /// - `VICTORY_AUTOSTART=<wait>:<button>,...`: one press per step, each
+    ///   `<wait>` seconds after the one before (the first after input
+    ///   starts); nothing after the last step.
+    /// - `VICTORY_PRESS_FILE=<path>`: when that file appears, the button it
+    ///   names is pressed once and the file is removed, for a script or a
+    ///   person that looks at the screen before choosing a button.
+    ///
+    /// Buttons: A, B, X, Y, Up, Down, Left, Right, Menu, View. Returns the
+    /// button held now, if any: its virtual key and its host pad bit.
+    #[cfg(feature = "diagnostics")]
+    fn auto_press() -> Option<(u8, u16)> {
+        struct Auto {
+            start: Instant,
+            steps: Vec<(f64, &'static str, u8, u16)>,
+            next: usize,
+            held: Option<(Instant, u8, u16)>,
+            file: Option<std::path::PathBuf>,
+            looked: Instant,
+            stopped: bool,
+        }
+        fn button(name: &str) -> Option<(&'static str, u8, u16)> {
+            Some(match name.trim().to_ascii_lowercase().as_str() {
+                "a" => ("A", 0x0D, XINPUT_GAMEPAD_A),
+                "b" => ("B", 0x08, XINPUT_GAMEPAD_B),
+                "x" => ("X", b'X', XINPUT_GAMEPAD_X),
+                "y" => ("Y", b'Y', XINPUT_GAMEPAD_Y),
+                "up" => ("Up", 0x26, XINPUT_GAMEPAD_DPAD_UP),
+                "down" => ("Down", 0x28, XINPUT_GAMEPAD_DPAD_DOWN),
+                "left" => ("Left", 0x25, XINPUT_GAMEPAD_DPAD_LEFT),
+                "right" => ("Right", 0x27, XINPUT_GAMEPAD_DPAD_RIGHT),
+                "menu" => ("Menu", 0x1B, XINPUT_GAMEPAD_START),
+                "view" => ("View", 0x09, XINPUT_GAMEPAD_BACK),
+                _ => return None,
+            })
+        }
+        static AUTO: LazyLock<Option<Mutex<Auto>>> = LazyLock::new(|| {
+            let script = std::env::var("VICTORY_AUTOSTART").unwrap_or_default();
+            let mut at = 0.0;
+            let steps: Vec<_> = script
+                .split(',')
+                .filter_map(|step| {
+                    let (wait, name) = step.split_once(':')?;
+                    let (name, key, bit) = button(name)?;
+                    at += wait.trim().parse::<f64>().ok()?;
+                    Some((at, name, key, bit))
+                })
+                .collect();
+            let file = std::env::var_os("VICTORY_PRESS_FILE").map(std::path::PathBuf::from);
+            if steps.is_empty() && file.is_none() {
+                return None;
+            }
+            eprintln!("VIctory: unattended presses: {} scripted, press file {file:?}", steps.len());
+            Some(Mutex::new(Auto {
+                start: Instant::now(),
+                steps,
+                next: 0,
+                held: None,
+                file,
+                looked: Instant::now(),
+                stopped: false,
+            }))
+        });
+        let mut auto = AUTO.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((since, key, bit)) = auto.held {
+            if since.elapsed() < Duration::from_millis(250) {
+                return Some((key, bit));
+            }
+            auto.held = None;
+        }
+        if auto.stopped {
+            return None;
+        }
+        if WORLD_LOADING.load(std::sync::atomic::Ordering::Relaxed) {
+            auto.stopped = true;
+            tracing::info!("the world load started: no more unattended presses");
+            return None;
+        }
+        let now = auto.start.elapsed().as_secs_f64();
+        let mut press = None;
+        if let Some(&(at, name, key, bit)) = auto.steps.get(auto.next)
+            && now >= at
+        {
+            auto.next += 1;
+            press = Some((name, key, bit, "script"));
+        } else if auto.looked.elapsed() >= Duration::from_millis(200) {
+            auto.looked = Instant::now();
+            if let Some(path) = auto.file.clone()
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                let _ = std::fs::remove_file(&path);
+                if let Some((name, key, bit)) = button(&text) {
+                    press = Some((name, key, bit, "press file"));
+                } else {
+                    tracing::warn!(text, "unattended press: no such button");
+                }
+            }
+        }
+        let (name, key, bit, from) = press?;
+        tracing::info!(button = name, from, seconds = format_args!("{now:.1}"), "unattended press");
+        auto.held = Some((Instant::now(), key, bit));
+        Some((key, bit))
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

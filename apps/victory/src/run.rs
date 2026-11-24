@@ -138,6 +138,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -341,4 +342,26 @@ mod tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Debugging aid (local): `VICTORY_POKE=<rva>:<byte>,...` (hex) ORs each byte
+/// into title+rva once, before the title runs, e.g. a flag that makes a title
+/// thread end. Only writable bytes inside the image are touched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn poke(base: usize, size: usize) {
+    let Ok(list) = std::env::var("VICTORY_POKE") else {
+        return;
+    };
+    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    for (rva, value) in list.split(',').filter_map(|p| p.split_once(':')).filter_map(|(r, v)| Some((hex(r)?, hex(v)?))) {
+        if rva >= size || value > 0xff {
+            continue;
+        }
+        // SAFETY: one byte inside the mapped image; the title has not started yet.
+        unsafe {
+            let p = (base + rva) as *mut u8;
+            p.write_volatile(p.read_volatile() | value as u8);
+        }
+        eprintln!("VIctory: poked title+{rva:#x} |= {value:#x}");
+    }
 }

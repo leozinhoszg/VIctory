@@ -265,6 +265,7 @@ pub extern "C" fn ffxCreateContext(
     };
     upscale.next = (&raw mut dx12).cast();
     // SAFETY: the SDK's call with a chain that outlives it.
+    CREATE_FLAGS.store(upscale.flags, std::sync::atomic::Ordering::Relaxed);
     let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
     let provider = provider_name(context);
     tracing::info!(
@@ -409,6 +410,141 @@ fn log_query(kind: u64, desc: *mut Header, r: ReturnCode) {
     }
 }
 
+/// The flags the title created its upscale context with (`FFX_UPSCALE_ENABLE_*`).
+static CREATE_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const FFX_HDR: u32 = 1 << 0;
+const FFX_DISPLAY_RESOLUTION_MOTION_VECTORS: u32 = 1 << 1;
+const FFX_MOTION_VECTORS_JITTER_CANCELLATION: u32 = 1 << 2;
+const FFX_DEPTH_INVERTED: u32 = 1 << 3;
+const FFX_AUTO_EXPOSURE: u32 = 1 << 5;
+
+/// `VslInputs` of `tools/sl_bridge/sl_bridge.cpp`.
+#[repr(C)]
+struct VslInputs {
+    color: *mut c_void,
+    color_state: u32,
+    depth: *mut c_void,
+    depth_state: u32,
+    motion: *mut c_void,
+    motion_state: u32,
+    exposure: *mut c_void,
+    exposure_state: u32,
+    output: *mut c_void,
+    output_state: u32,
+    render: [u32; 2],
+    out: [u32; 2],
+    jitter: [f32; 2],
+    mvec_scale: [f32; 2],
+    camera_near: f32,
+    camera_far: f32,
+    camera_fov: f32,
+    pre_exposure: f32,
+    reset: i32,
+    depth_inverted: i32,
+    hdr: i32,
+    motion_jittered: i32,
+    auto_exposure: i32,
+}
+
+type VslInit = unsafe extern "C" fn(*const u16, *const u16, *mut c_void) -> i32;
+type VslEvaluate = unsafe extern "C" fn(*mut c_void, *const VslInputs) -> i32;
+
+/// DLSS through NVIDIA Streamline (`VICTORY_DLSS_DIR=<folder>` with `victory_sl_bridge.dll` beside
+/// Streamline's signed `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` and `nvngx_dlss.dll`): the
+/// title's upscale goes to DLSS instead of AMD's upscaler, whose context still answers creation and the
+/// jitter queries. Streamline's log and the bridge's go to `VICTORY_DLSS_LOGS` (default: the folder).
+struct Dlss {
+    evaluate: VslEvaluate,
+}
+
+fn dlss() -> Option<&'static Dlss> {
+    static DLSS: OnceLock<Option<Dlss>> = OnceLock::new();
+    DLSS.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_DLSS_DIR")?);
+        let logs = std::env::var_os("VICTORY_DLSS_LOGS").map_or_else(|| dir.clone(), std::path::PathBuf::from);
+        let bridge: Vec<u16> = dir.join("victory_sl_bridge.dll").as_os_str().encode_wide_nul();
+        // SAFETY: a nul-terminated path.
+        let module = match unsafe { LoadLibraryW(PCWSTR(bridge.as_ptr())) } {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(?dir, error = %e, "dlss: victory_sl_bridge.dll did not load");
+                return None;
+            }
+        };
+        // SAFETY: the bridge's exports, of these types.
+        let (init, evaluate) = unsafe {
+            let init = GetProcAddress(module, PCSTR(b"vsl_init\0".as_ptr()));
+            let evaluate = GetProcAddress(module, PCSTR(b"vsl_evaluate\0".as_ptr()));
+            match (init, evaluate) {
+                (Some(i), Some(e)) => (
+                    std::mem::transmute::<Farproc, VslInit>(i),
+                    std::mem::transmute::<Farproc, VslEvaluate>(e),
+                ),
+                _ => {
+                    tracing::error!("dlss: the bridge lacks vsl_init or vsl_evaluate");
+                    return None;
+                }
+            }
+        };
+        let device = host_device()?;
+        let dir_w: Vec<u16> = dir.as_os_str().encode_wide_nul();
+        let logs_w: Vec<u16> = logs.as_os_str().encode_wide_nul();
+        // SAFETY: nul-terminated paths and the live host device.
+        let r = unsafe { init(dir_w.as_ptr(), logs_w.as_ptr(), device) };
+        if r != 0 {
+            tracing::error!(result = r, ?logs, "dlss: Streamline did not start; the upscale stays AMD's (see victory_sl_bridge.log)");
+            return None;
+        }
+        tracing::info!(?dir, ?logs, "dlss: Streamline started, DLSS takes the title's upscale");
+        Some(Dlss { evaluate })
+    })
+    .as_ref()
+}
+
+/// Records DLSS for an upscale whose resources are host textures in the states set for it.
+fn dlss_upscale(d: &DispatchUpscale, list: *mut c_void) -> Option<i32> {
+    let dl = dlss()?;
+    let flags = CREATE_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
+    let sign = |name: &str| if std::env::var(name).is_ok_and(|v| v.trim() == "-1") { -1.0 } else { 1.0 };
+    let (jx, mv) = (sign("VICTORY_DLSS_JITTER_SIGN"), sign("VICTORY_DLSS_MVEC_SIGN"));
+    // FidelityFX scales motion vectors into pixels; Streamline wants them in [-1, 1] of the frame.
+    let mv_size = if flags & FFX_DISPLAY_RESOLUTION_MOTION_VECTORS != 0 { d.upscale_size } else { d.render_size };
+    let res = |i: usize| d.resources[i].resource;
+    let inputs = VslInputs {
+        color: res(0),
+        color_state: HOST_NON_PIXEL_SHADER_RESOURCE,
+        depth: res(1),
+        depth_state: HOST_NON_PIXEL_SHADER_RESOURCE,
+        motion: res(2),
+        motion_state: HOST_NON_PIXEL_SHADER_RESOURCE,
+        exposure: res(3),
+        exposure_state: HOST_NON_PIXEL_SHADER_RESOURCE,
+        output: res(OUTPUT),
+        output_state: HOST_UNORDERED_ACCESS,
+        render: d.render_size,
+        out: d.upscale_size,
+        jitter: [d.jitter[0] * jx, d.jitter[1] * jx],
+        mvec_scale: [
+            mv * d.motion_vector_scale[0] / mv_size[0].max(1) as f32,
+            mv * d.motion_vector_scale[1] / mv_size[1].max(1) as f32,
+        ],
+        camera_near: d.camera[0],
+        camera_far: d.camera[1],
+        camera_fov: d.camera[2],
+        pre_exposure: d.pre_exposure,
+        reset: i32::from(d.reset),
+        depth_inverted: i32::from(flags & FFX_DEPTH_INVERTED != 0),
+        hdr: i32::from(flags & FFX_HDR != 0),
+        motion_jittered: i32::from(flags & FFX_MOTION_VECTORS_JITTER_CANCELLATION != 0),
+        auto_exposure: i32::from(flags & FFX_AUTO_EXPOSURE != 0 || res(3).is_null()),
+    };
+    if inputs.depth.is_null() || inputs.motion.is_null() {
+        return Some(-1);
+    }
+    // SAFETY: an open host list and live host textures in the states named.
+    Some(unsafe { (dl.evaluate)(list, &raw const inputs) })
+}
+
 pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
     let Some(api) = api() else { return ERROR };
     if context.is_null() || desc.is_null() {
@@ -456,8 +592,25 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         return ERROR_PARAMETER;
     }
     d.command_list = list.list.as_raw();
-    // SAFETY: the SDK's call on an open host list with live textures.
-    let r = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
+    let r = match dlss_upscale(&d, d.command_list) {
+        Some(0) => {
+            static FIRST_DLSS: std::sync::Once = std::sync::Once::new();
+            FIRST_DLSS.call_once(|| {
+                tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, jitter = ?d.jitter, mv_scale = ?d.motion_vector_scale, camera = ?d.camera, flags = CREATE_FLAGS.load(std::sync::atomic::Ordering::Relaxed), "dlss: first upscale recorded by DLSS");
+            });
+            OK
+        }
+        other => {
+            if let Some(code) = other {
+                static FAILED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                    tracing::warn!(code, "dlss: the upscale failed; AMD's upscaler takes this frame");
+                }
+            }
+            // SAFETY: the SDK's call on an open host list with live textures.
+            unsafe { (api.dispatch)(context, (&raw const d).cast()) }
+        }
+    };
     // The upscaler bound its own heaps, root signature and pipeline.
     crate::list::forget_host_bindings(title_list);
     static FIRST: std::sync::Once = std::sync::Once::new();

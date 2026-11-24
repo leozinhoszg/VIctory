@@ -5837,7 +5837,10 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        let build = option_env!("VICTORY_BUILD_LABEL").unwrap_or(env!("CARGO_PKG_VERSION"));
+        let note = CAPTION_NOTE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let note = if note.is_empty() { "upscaler do t\u{ed}tulo".to_owned() } else { note };
+        let text = format!(" | VIctory {build} | {note} | {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -6479,4 +6482,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
+}
+
+/// What the window title says about the upscaler (empty: the title's own).
+static CAPTION_NOTE: Mutex<String> = Mutex::new(String::new());
+
+/// Sets what the window title says about the upscaler in use.
+pub(crate) fn set_caption_note(note: String) {
+    *CAPTION_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = note;
 }

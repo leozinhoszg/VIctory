@@ -10,10 +10,13 @@
 #include <cstdarg>
 #include <cstdint>
 #include <string>
+#include <cstring>
 
 #include <sl.h>
 #include <sl_consts.h>
 #include <sl_dlss.h>
+
+static std::wstring g_dir;
 
 namespace
 {
@@ -122,6 +125,7 @@ __declspec(dllexport) int vsl_init(const wchar_t* sl_dir, const wchar_t* log_dir
     if (g_ready)
         return 0;
     std::wstring dir(sl_dir ? sl_dir : L".");
+    g_dir = dir;
     std::wstring logs(log_dir ? log_dir : dir.c_str());
     CreateDirectoryW(logs.c_str(), nullptr);
     std::wstring bridge_log = logs + L"\\victory_sl_bridge.log";
@@ -276,6 +280,37 @@ __declspec(dllexport) int vsl_evaluate(void* command_list, const VslInputs* in)
             in->mvec_scale_x, in->mvec_scale_y, in->reset);
     count++;
     return r == sl::Result::eOk ? 0 : 14;
+}
+
+static std::string file_version(const std::wstring& path)
+{
+    DWORD handle = 0;
+    DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
+    if (!size)
+        return "?";
+    std::string data(size, '\0');
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data()))
+        return "?";
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&info), &len) || !info)
+        return "?";
+    char text[48];
+    snprintf(text, sizeof(text), "%u.%u.%u", HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
+             HIWORD(info->dwFileVersionLS));
+    return text;
+}
+
+// Writes "DLSS <nvngx_dlss version> (Streamline <sl.interposer version>)" into `out`; returns its length.
+__declspec(dllexport) int vsl_versions(char* out, int len)
+{
+    if (!out || len <= 0)
+        return 0;
+    std::string text = "DLSS " + file_version(g_dir + L"\\nvngx_dlss.dll") + " (Streamline " +
+                       file_version(g_dir + L"\\sl.interposer.dll") + ")";
+    int n = (int)text.size() < len ? (int)text.size() : len;
+    memcpy(out, text.data(), n);
+    return n;
 }
 
 __declspec(dllexport) void vsl_shutdown()

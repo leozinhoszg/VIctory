@@ -268,6 +268,10 @@ pub extern "C" fn ffxCreateContext(
     CREATE_FLAGS.store(upscale.flags, std::sync::atomic::Ordering::Relaxed);
     let r = unsafe { (api.create)(context, (&raw mut upscale).cast(), std::ptr::null()) };
     let provider = provider_name(context);
+    crate::host::set_caption_note(format!(
+        "FSR host {provider} {}x{}\u{2192}{}x{}",
+        upscale.max_render[0], upscale.max_render[1], upscale.max_upscale[0], upscale.max_upscale[1]
+    ));
     tracing::info!(
         render = ?upscale.max_render, upscale = ?upscale.max_upscale, flags = upscale.flags, result = r, provider,
         "ffx: upscale context on the host GPU"
@@ -455,6 +459,8 @@ type VslEvaluate = unsafe extern "C" fn(*mut c_void, *const VslInputs) -> i32;
 /// jitter queries. Streamline's log and the bridge's go to `VICTORY_DLSS_LOGS` (default: the folder).
 struct Dlss {
     evaluate: VslEvaluate,
+    /// Streamline's and DLSS's versions, for the window title.
+    versions: String,
 }
 
 fn dlss() -> Option<&'static Dlss> {
@@ -495,8 +501,19 @@ fn dlss() -> Option<&'static Dlss> {
             tracing::error!(result = r, ?logs, "dlss: Streamline did not start; the upscale stays AMD's (see victory_sl_bridge.log)");
             return None;
         }
-        tracing::info!(?dir, ?logs, "dlss: Streamline started, DLSS takes the title's upscale");
-        Some(Dlss { evaluate })
+        let mut buf = [0u8; 160];
+        // SAFETY: the bridge export (optional), writing at most the buffer's length.
+        let versions = unsafe { GetProcAddress(module, PCSTR(b"vsl_versions\0".as_ptr())) }
+            .map(|f| {
+                // SAFETY: of this type.
+                let f = unsafe { std::mem::transmute::<Farproc, unsafe extern "C" fn(*mut u8, i32) -> i32>(f) };
+                // SAFETY: a buffer of that length.
+                let n = unsafe { f(buf.as_mut_ptr(), buf.len() as i32) }.clamp(0, buf.len() as i32) as usize;
+                String::from_utf8_lossy(&buf[..n]).into_owned()
+            })
+            .unwrap_or_else(|| "Streamline".to_owned());
+        tracing::info!(?dir, ?logs, %versions, "dlss: Streamline started, DLSS takes the title's upscale");
+        Some(Dlss { evaluate, versions })
     })
     .as_ref()
 }
@@ -597,6 +614,12 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
             static FIRST_DLSS: std::sync::Once = std::sync::Once::new();
             FIRST_DLSS.call_once(|| {
                 tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, jitter = ?d.jitter, mv_scale = ?d.motion_vector_scale, camera = ?d.camera, flags = CREATE_FLAGS.load(std::sync::atomic::Ordering::Relaxed), "dlss: first upscale recorded by DLSS");
+                if let Some(dl) = dlss() {
+                    crate::host::set_caption_note(format!(
+                        "{} {}x{}\u{2192}{}x{}",
+                        dl.versions, d.render_size[0], d.render_size[1], d.upscale_size[0], d.upscale_size[1]
+                    ));
+                }
             });
             OK
         }

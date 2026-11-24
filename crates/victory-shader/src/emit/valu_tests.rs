@@ -1422,7 +1422,18 @@ fn v_cvt_f32_f64_matches_ieee754() {
         .collect();
     run_cases(&plain, &inputs, |backend, i, _, got| {
         let x = values[i];
-        let want = (x as f32).to_bits();
+        // The console's default float mode flushes f32 results below the
+        // smallest normal to signed zero. The translation decides that on the
+        // exact value, before rounding (so max subnormal + 0.5 ulp is 0, not
+        // the smallest normal); which of the two the console does is not
+        // measured.
+        let r = x as f32;
+        let r = if x != 0.0 && x.abs() < f64::from(f32::MIN_POSITIVE) {
+            f32::from_bits(r.to_bits() & 0x8000_0000)
+        } else {
+            r
+        };
+        let want = r.to_bits();
         if x.is_nan() {
             assert!(
                 f32::from_bits(got).is_nan() && (got & 0x0040_0000) != 0,

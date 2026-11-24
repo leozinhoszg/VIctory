@@ -7540,7 +7540,7 @@ impl<'a> Lower<'a> {
                 // double type: the host need not support doubles). Round to
                 // nearest even; a result below the smallest normal float is
                 // signed zero, as the console's default float mode flushes.
-                let x = self.src64(inst, 0)?;
+                let x = self.src64_float(inst, 0)?;
                 let (lo, hi) = self.split64(x);
                 let r = self.f64_bits_to_f32_bits(lo, hi);
                 let r = self.as_float(r);
@@ -7896,7 +7896,42 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
+            return Err("64-bit operand modifiers");
+        }
+        self.src64_bits(inst, k)
+    }
+
+    /// A 64-bit float source with its `abs` / `neg` input modifiers, which on a double only
+    /// touch the sign (bit 31 of the high dword): `|x|` first, then `-`.
+    fn src64_float(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        let x = self.src64_bits(inst, k)?;
+        if !abs && !neg {
+            return Ok(x);
+        }
+        let c = self.cur;
+        let (lo, mut hi) = self.split64(x);
+        if abs {
+            let m = self.s.m.i32(0x7fff_ffff);
+            hi = self.s.m.bin(c, Bin::And, hi, m);
+        }
+        if neg {
+            let m = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, m);
+        }
+        Ok(self.join64(lo, hi))
+    }
+
+    /// A 64-bit source's bits, without its input modifiers.
+    fn src64_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
             return Err("64-bit operand modifiers");
         }
         let c = self.cur;

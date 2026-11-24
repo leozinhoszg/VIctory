@@ -1288,10 +1288,10 @@ impl Batch {
 /// them (tiled memory, page mappings), which read as zeros here; a title
 /// destination (`title_dst`) that is not all mapped is left alone.
 ///
-/// The source is read through the kernel (`ReadProcessMemory`), which
-/// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
-/// cost about 2 ms per copy in the title's big pools (it walks the page
-/// tables to the region's end), which made copies run at 100-200 MB/s.
+/// The source is read in place by a copy that reports an unmapped page
+/// instead of faulting ([`read`]). Asking `VirtualQuery` first cost about
+/// 2 ms per copy in the title's big pools (it walks the page tables to the
+/// region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
@@ -1307,7 +1307,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
-        // The kernel writes the destination: it must not be guarded.
+        // Opened at once, not block by block through write faults (and the
+        // kernel's copy does not fault into our handler at all).
         crate::watch::writing(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
@@ -1346,7 +1347,30 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
+///
+/// In place: the title's memory is in our process, so this is one `rep
+/// movsb` whose fault on a page the title unmapped our handler turns into
+/// `false` (`watch::try_copy`). The kernel's copy ([`kernel_read`]) reports
+/// such a page the same way but is a system call per range, of which a
+/// world frame of Grand Theft Auto VI makes thousands.
+/// `VICTORY_COPY_MODE=kernel` (diagnostics builds) uses it throughout, to
+/// compare.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::mode() == 3 {
+        return kernel_read(src, dst, len);
+    }
+    // The in-place copy runs forwards byte by byte, so ranges that overlap
+    // (none are expected) keep the kernel's copy.
+    let (s, d) = (src as usize, dst as usize);
+    if s < d.saturating_add(len) && d < s.saturating_add(len) {
+        return kernel_read(src, dst, len);
+    }
+    crate::watch::try_copy(dst, src, len)
+}
+
+/// As [`read`], through the kernel (`ReadProcessMemory` on our own process).
+fn kernel_read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;

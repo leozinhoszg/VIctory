@@ -1,7 +1,8 @@
 //! Diagnostics: where the submission copies of title memory go (which
 //! ranges, how often, of what memory) and what limits their rate, logged
 //! with the frame-rate line. `VICTORY_COPY_MODE=plain` copies without the
-//! mapped-page guard, `none` skips the copies (both for timing only).
+//! mapped-page guard, `none` skips the copies (both for timing only);
+//! `kernel` reads title memory through the kernel instead of in place.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -45,12 +46,14 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
-/// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
+/// How copies run: 0 guarded (as always), 1 plain, 2 not at all, 3 guarded
+/// through the kernel.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {
         Ok("plain") => 1,
         Ok("none") => 2,
+        Ok("kernel") => 3,
         _ => 0,
     })
 }

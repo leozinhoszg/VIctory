@@ -229,23 +229,80 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Registers the handler that takes writes to guarded blocks, once, ahead
-/// of the crash reporter's.
+// A copy that survives memory the title unmapped under it: one `rep movsb`
+// whose fault our handler turns into a return of 0 (the registers the
+// routine pushed are popped at the landing). Windows x64 calling
+// convention: destination, source, length.
+core::arch::global_asm!(
+    ".globl victory_try_copy",
+    "victory_try_copy:",
+    "push rsi",
+    "push rdi",
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rcx, r8",
+    ".globl victory_try_copy_move",
+    "victory_try_copy_move:",
+    "rep movsb",
+    "mov eax, 1",
+    "pop rdi",
+    "pop rsi",
+    "ret",
+    ".globl victory_try_copy_fault",
+    "victory_try_copy_fault:",
+    "xor eax, eax",
+    "pop rdi",
+    "pop rsi",
+    "ret",
+);
+
+unsafe extern "C" {
+    fn victory_try_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
+    static victory_try_copy_move: u8;
+    static victory_try_copy_fault: u8;
+}
+
+/// Copies `len` bytes from `src` to `dst` in place; false, with the bytes
+/// before it copied, if a page of the source (or of the destination)
+/// cannot be accessed. A write into a guarded block is taken by the handler
+/// as any other write is. The ranges must not overlap.
+pub(crate) fn try_copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    install();
+    // SAFETY: the caller's ranges; a fault inside the move is taken by our
+    // handler, which lands the routine on its failure return.
+    unsafe { victory_try_copy(dst, src, len) != 0 }
+}
+
+/// Registers the handler that takes writes to guarded blocks and faults of
+/// [`try_copy`], once, ahead of the crash reporter's.
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
-        EXCEPTION_POINTERS,
+        AddVectoredExceptionHandler, CONTEXT, EXCEPTION_CONTINUE_EXECUTION,
+        EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A fault of our in-place copy that is not a write to a guarded
+        // block: the copy returns false instead.
+        // SAFETY: the context of the faulting thread, ours to change.
+        let context = unsafe { &mut *(*info).ContextRecord };
+        let in_copy = context.Rip == (&raw const victory_try_copy_move) as u64;
+        let land = |context: &mut CONTEXT| {
+            context.Rip = (&raw const victory_try_copy_fault) as u64;
+            EXCEPTION_CONTINUE_EXECUTION
+        };
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
-            return EXCEPTION_CONTINUE_SEARCH;
+            return if in_copy {
+                land(context)
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
         }
         let at = r.ExceptionInformation[1];
         // Held across both checks: another thread may have opened the block
@@ -259,6 +316,9 @@ fn install() {
         }
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
+        } else if in_copy {
+            drop(g);
+            land(context)
         } else {
             EXCEPTION_CONTINUE_SEARCH
         }
@@ -289,6 +349,61 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn an_in_place_copy_stops_at_an_unmapped_page() {
+        // SAFETY: two reserved blocks of which the first is committed, freed
+        // at the end.
+        unsafe {
+            let p =
+                VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!VirtualAlloc(p.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            p.write_bytes(7, PAGE);
+            let mut out = vec![0u8; 2 * PAGE];
+            assert!(try_copy(out.as_mut_ptr(), p, PAGE));
+            assert!(out[..PAGE].iter().all(|&b| b == 7));
+            out.fill(0);
+            // A source that runs into unmapped memory: what came before it
+            // is copied, and nothing after.
+            assert!(!try_copy(out.as_mut_ptr(), p, 2 * PAGE));
+            assert!(out[..PAGE].iter().all(|&b| b == 7) && out[PAGE..].iter().all(|&b| b == 0));
+            assert!(!try_copy(out.as_mut_ptr(), p.add(PAGE), 16));
+            // A destination that cannot be written fails too.
+            assert!(!try_copy(p.add(PAGE), out.as_ptr(), 16));
+            assert!(try_copy(out.as_mut_ptr(), p, 0));
+            VirtualFree(p.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn an_in_place_copy_writes_through_a_guarded_block() {
+        // SAFETY: a committed block left read-only as a copy leaves a
+        // guarded one, freed at the end.
+        unsafe {
+            let p = VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!p.is_null());
+            let block = p as usize / BLOCK;
+            {
+                let mut g = guards();
+                protect(&mut g, block, block + 1);
+            }
+            let from = [9u8; 32];
+            assert!(try_copy(p, from.as_ptr(), from.len()));
+            assert!(
+                std::slice::from_raw_parts(p, from.len())
+                    .iter()
+                    .all(|&b| b == 9)
+            );
+            assert!(!guards().protected.contains(&block));
+            VirtualFree(p.cast(), 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

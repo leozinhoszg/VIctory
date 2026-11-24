@@ -1230,7 +1230,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: cbv_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1862,7 +1862,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: cbv_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -2481,4 +2481,23 @@ mod tests {
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
+}
+
+/// The largest constant buffer view D3D12 makes
+/// (`D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT` 16-byte elements).
+const MAX_CBV: u32 = 4096 * 16;
+
+/// A constant buffer view's size: a multiple of 256, at most [`MAX_CBV`]. The
+/// console takes larger ones (Series S mode asks for 1,135,872 bytes); a
+/// larger size is an invalid call that removes the host device, so the view
+/// covers the first 64 KiB and reads past them return zero.
+fn cbv_size(size: u32) -> u32 {
+    let size = size.next_multiple_of(256);
+    if size > MAX_CBV {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(size, max = MAX_CBV, "a constant buffer view larger than D3D12 allows: it covers the first 64 KiB");
+        }
+    }
+    size.min(MAX_CBV)
 }

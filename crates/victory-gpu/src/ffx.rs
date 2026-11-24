@@ -150,6 +150,17 @@ fn api() -> Option<&'static Api> {
             // SAFETY: a nul-terminated path.
             unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }.ok()
         };
+        // `VICTORY_FFX_PRELOAD=<dll>`: a module loaded before AMD's, e.g.
+        // OptiScaler, which hooks the loader as it loads and answers the
+        // upscale with another upscaler (DLSS on NVIDIA).
+        if let Some(pre) = std::env::var_os("VICTORY_FFX_PRELOAD") {
+            let path: Vec<u16> = pre.as_os_str().encode_wide_nul();
+            // SAFETY: a nul-terminated path.
+            match unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) } {
+                Ok(_) => tracing::info!(?pre, "ffx: preloaded before AMD's loader"),
+                Err(e) => tracing::error!(?pre, error = %e, "ffx: VICTORY_FFX_PRELOAD did not load"),
+            }
+        }
         let _ = load("amd_fidelityfx_upscaler_dx12.dll");
         let Some(loader) = load("amd_fidelityfx_loader_dx12.dll") else {
             tracing::error!(?dir, "ffx: amd_fidelityfx_loader_dx12.dll not found; set VICTORY_FFX_DIR to the SDK's signedbin");
@@ -157,7 +168,14 @@ fn api() -> Option<&'static Api> {
         };
         let get = |name: &[u8]| {
             // SAFETY: a loaded module and a nul-terminated name.
-            unsafe { GetProcAddress(loader, PCSTR(name.as_ptr())) }
+            let f = unsafe { GetProcAddress(loader, PCSTR(name.as_ptr())) };
+            if f.is_none() {
+                // Without it every FidelityFX call fails, and a title that
+                // divides by what a query returns stops there: say so.
+                let export = String::from_utf8_lossy(&name[..name.len() - 1]);
+                tracing::error!(?dir, %export, "ffx: the loader does not export this; FidelityFX calls will fail");
+            }
+            f
         };
         // SAFETY: the SDK's exports, of these types (`ffx_api.h`).
         unsafe {

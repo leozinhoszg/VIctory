@@ -585,6 +585,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
+/// Words from one present plane to the next (the planes Grand Theft Auto VI
+/// presents in Series S mode are this far apart: frame token, resource
+/// count, resources, source rectangles, placement, then four more).
+const PLANE_WORDS: usize = 9;
+
 /// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
 pub(crate) struct Plane {
@@ -828,7 +833,26 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The planes over the first, each with the state it is in.
+        let over: Vec<_> = (1..planes as usize)
+            .filter_map(|i| {
+                // SAFETY: the title passes `planes` plane descriptions,
+                // `PLANE_WORDS` words apart; a plane lists `count` resources.
+                let resource = unsafe {
+                    let plane = &*plane_parameters.cast::<u64>().add(PLANE_WORDS * i).cast::<Plane>();
+                    if plane.count == 0 || plane.resources.is_null() {
+                        return None;
+                    }
+                    *plane.resources
+                };
+                let texture = crate::resource::host_resource(resource)?;
+                let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
+                crate::resource::host_transition(resource, state);
+                Some((texture, state))
+            })
+            .collect();
+        let shown = host.present(texture, state, frame, &over);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

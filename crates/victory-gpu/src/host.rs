@@ -5610,6 +5610,8 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// Draws the planes of a presentation of more than one, once one came.
+    composer: Option<crate::planes::Composer>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -5886,15 +5888,46 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// `over` are the presentation's other planes with their states, drawn
+    /// over `texture` in order (`planes`); the window then has the size of
+    /// the largest plane.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        over: &[(&ID3D12Resource, u32)],
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        if !over.is_empty()
+            && let Some(p) = presenter.as_mut()
+            && p.composer.as_ref().is_none_or(|c| c.format() != format)
+        {
+            p.composer = match crate::planes::Composer::new(&self.device, format) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no plane composer: only the first plane is shown");
+                    None
+                }
+            };
+        }
+        let composed = !over.is_empty() && presenter.as_ref().is_some_and(|p| p.composer.is_some());
+        let (mut width, mut height) = (desc.Width as u32, desc.Height);
+        if composed {
+            for (t, _) in over {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                if d.Width * u64::from(d.Height) > u64::from(width) * u64::from(height) {
+                    (width, height) = (d.Width as u32, d.Height);
+                }
+            }
+        }
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
@@ -5952,31 +5985,55 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            let composer = p.composer.as_ref().filter(|_| composed);
+            // What reaches the screen, as a copy source for the read-backs.
+            let shown: &ID3D12Resource = if let Some(composer) = composer {
+                let mut planes = vec![(texture, state.0 as u32, format)];
+                planes.extend(
+                    over.iter()
+                        .filter_map(|&(t, s)| Some((t, s, swap_format(t.GetDesc().Format)?))),
+                );
+                let target = self.rtv(Some(&back), None);
+                composer.compose(&self.device, list, (&back, target), (width, height), &planes);
+                &back
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+                texture
+            };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, shown))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, shown) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            let _ = shown;
+            if composer.is_some() {
+                // The composer leaves the back buffer a copy source.
+                list.ResourceBarrier(&[transition(
                     &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                )]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -6039,6 +6096,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                composer: None,
             })
         }
     }

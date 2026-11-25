@@ -96,7 +96,15 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let run = || victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        // `VICTORY_WAVE_WIDE=<hash>,...`: the wave-wide form for those programs only.
+        if victory_shader::emit::wave_wide_listed(&blake3::hash(c).to_hex()[..16]) {
+            victory_shader::emit::with_wave_wide(run)
+        } else {
+            run()
+        }
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),

@@ -268,6 +268,37 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    static WAVE_WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the wave-wide form of wave64 programs on for what it translates on this
+/// thread, as `VICTORY_WAVE_WIDE=1` turns it on for every program: for callers that pick
+/// the programs (by hash, `VICTORY_WAVE_WIDE=<hash>,...`), so that a program known to
+/// need it gets it without moving every other one to group barriers in branches.
+pub fn with_wave_wide<R>(f: impl FnOnce() -> R) -> R {
+    let was = WAVE_WIDE_HERE.replace(true);
+    let r = f();
+    WAVE_WIDE_HERE.set(was);
+    r
+}
+
+/// Whether `VICTORY_WAVE_WIDE` lists the container whose 16-digit hash (the BLAKE3 prefix a
+/// run's log names it by) is `hash`.
+pub fn wave_wide_listed(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_WIDE")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -379,7 +410,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // (or for the programs a caller picked, `with_wave_wide`)
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WAVE_WIDE_HERE.get();
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
